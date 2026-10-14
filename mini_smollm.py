@@ -197,8 +197,8 @@ def train(args):
     store = TokenStore(args.data, args.seq_len, args.seed)
     tok = AutoTokenizer.from_pretrained(Path(args.data) / "tokenizer")
     dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
-    config = LlamaConfig(vocab_size=len(tok), hidden_size=384, intermediate_size=1024,
-             num_hidden_layers=8, num_attention_heads=6, num_key_value_heads=6,
+    config = LlamaConfig(vocab_size=len(tok), hidden_size=512, intermediate_size=1536,
+             num_hidden_layers=12, num_attention_heads=8, num_key_value_heads=8,
              max_position_embeddings=args.seq_len, rope_theta=10000.,
              hidden_act="silu", tie_word_embeddings=True, attention_dropout=0.,
              eos_token_id=tok.eos_token_id, bos_token_id=tok.bos_token_id,
