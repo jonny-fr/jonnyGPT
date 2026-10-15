@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Train a randomly initialized 66M Llama: prepare -> verify -> train -> sample."""
+"""Train small randomly initialized Llama models: prepare -> verify -> train -> sample (+ overfit check)."""
 import argparse
 import contextlib
 import csv
@@ -27,19 +27,61 @@ from rich.progress import (
 from transformers import AutoTokenizer, LlamaConfig, LlamaForCausalLM
 
 TOKENIZER = "HuggingFaceTB/SmolLM2-135M"
+EOS_TOKEN = "<|endoftext|>"
 SOURCES = {
     "web": ("HuggingFaceFW/fineweb-edu", "sample-10BT"),
     "math": ("HuggingFaceTB/finemath", "finemath-4plus"),
+    "stories": ("roneneldan/TinyStories", None),
 }
-CONSOLE = Console(stderr=True)
-LOG = logging.getLogger("mini_smollm")
+RECIPES = {
+    "web_math": {"weights": {"web": .9, "math": .1}, "tokenizer": TOKENIZER,
+                 "train_tokens": 1_000_000_000},
+    "tinystories": {"weights": {"stories": 1.0}, "tokenizer": "train",
+                    "train_tokens": 300_000_000},
+}
+MODEL_DEFAULTS = {
+    "hidden_size": 512, "intermediate_size": 1536,
+    "num_layers": 12, "num_heads": 8, "num_kv_heads": 8,
+}
+MODEL_KEYS = tuple(MODEL_DEFAULTS)
+CONFIG_KEYS = {
+    "hidden_size": "hidden_size", "intermediate_size": "intermediate_size",
+    "num_layers": "num_hidden_layers", "num_heads": "num_attention_heads",
+    "num_kv_heads": "num_key_value_heads",
+}
 TRAIN_DEFAULTS = {
     "seq_len": 512, "batch_size": 8, "accumulation": 4,
     "lr": 5e-4, "eval_batch_size": 8, "eval_batches": 64,
     "eval_every_minutes": 15.0, "log_every": 100,
     "checkpoint_every_minutes": 10.0, "gradient_checkpointing": False,
     "seed": 42, "warmup": .05, "decay": .20, "max_steps": None,
+    **MODEL_DEFAULTS,
 }
+PROMPT_SETS = {
+    "web": [
+        "The area of a rectangle is",
+        "Water freezes when",
+        "The solar system consists of",
+        "The sky is",
+        "Plants need sunlight because",
+        "A dog is different from a cat because",
+        "Photosynthesis is the process by which",
+        "The capital of France is",
+    ],
+    "stories": [
+        "Once upon a time, a little girl found a key.",
+        "Tom had a red ball. He threw it to his dog,",
+        "One day, a small bird was sad because",
+        "Mia and her mom went to the park. Mia saw",
+        "The boy put the apple in the box. Later, he opened the box and saw",
+        "Ben was scared of the dark, but",
+        "The cat sat on the mat. Then the dog came and",
+        "Lily wanted to bake a cake. First, she",
+    ],
+}
+CONSOLE = Console(stderr=True)
+OUTPUT = Console(highlight=False, soft_wrap=True)
+LOG = logging.getLogger("mini_smollm")
 
 
 def configure_logging(path, level):
@@ -148,7 +190,83 @@ def local_rows(path):
                 yield json.loads(line)
 
 
+def row_text(row):
+    text = row.get("text") or row.get("content") or row.get("code")
+    if not isinstance(text, str) or len(text.strip()) < 80:
+        return None
+    return text.strip()
+
+
+def text_digest(text):
+    return hashlib.sha256(text.encode("utf-8")).digest()
+
+
+def is_validation_digest(digest):
+    return int.from_bytes(digest[:8], "little") % 100 < 2
+
+
+def open_source(name, seed, shuffle_buffer):
+    repo, config = SOURCES[name]
+    rows = load_dataset(repo, config, split="train", streaming=True)
+    rows = rows.shuffle(seed=seed, buffer_size=shuffle_buffer)
+    return rows, {"repo": repo, "config": config}
+
+
+def train_tokenizer(texts, vocab_size, total=None):
+    """Byte-level BPE (no unknown tokens) trained with the `tokenizers` library."""
+    from tokenizers import Tokenizer, decoders, models, pre_tokenizers, trainers
+    from transformers import PreTrainedTokenizerFast
+
+    tokenizer = Tokenizer(models.BPE())
+    tokenizer.pre_tokenizer = pre_tokenizers.ByteLevel(add_prefix_space=False)
+    tokenizer.decoder = decoders.ByteLevel()
+    trainer = trainers.BpeTrainer(
+        vocab_size=vocab_size, special_tokens=[EOS_TOKEN],
+        initial_alphabet=pre_tokenizers.ByteLevel.alphabet(), show_progress=False,
+    )
+    tokenizer.train_from_iterator(texts, trainer=trainer, length=total)
+    return PreTrainedTokenizerFast(
+        tokenizer_object=tokenizer, bos_token=EOS_TOKEN,
+        eos_token=EOS_TOKEN, pad_token=EOS_TOKEN,
+    )
+
+
+def build_tokenizer(args, source, index):
+    if args.vocab_size < 512:
+        raise ValueError("--vocab-size must be at least 512.")
+    rows, _ = open_source(source, args.seed + index, args.shuffle_buffer)
+    started = time.monotonic()
+    counter = {"docs": 0}
+    LOG.info("Training byte-level BPE tokenizer: vocab=%d, up to %s documents from '%s'",
+             args.vocab_size, f"{args.tokenizer_docs:,}", source)
+
+    def texts():
+        for row in rows:
+            text = row_text(row)
+            if text is None or is_validation_digest(text_digest(text)):
+                continue
+            counter["docs"] += 1
+            if counter["docs"] % 25_000 == 0:
+                LOG.info("Tokenizer corpus: %s documents | elapsed=%s",
+                         f"{counter['docs']:,}", duration(time.monotonic() - started))
+            yield text[:args.max_chars]
+            if counter["docs"] >= args.tokenizer_docs:
+                return
+
+    tok = train_tokenizer(texts(), args.vocab_size, args.tokenizer_docs)
+    LOG.info("Tokenizer trained: %s tokens | %s documents | %s",
+             f"{len(tok):,}", f"{counter['docs']:,}", duration(time.monotonic() - started))
+    info = {"name": "trained_byte_level_bpe", "trained": True, "vocab_size": len(tok),
+            "training_documents": counter["docs"], "source": source}
+    return tok, info
+
+
 def prepare(args):
+    recipe = RECIPES[args.recipe]
+    if args.code_jsonl and args.recipe != "web_math":
+        raise ValueError("--code-jsonl is only supported with --recipe web_math.")
+    args.train_tokens = args.train_tokens or recipe["train_tokens"]
+    args.tokenizer = args.tokenizer or recipe["tokenizer"]
     root = Path(args.data).resolve()
     root.mkdir(parents=True, exist_ok=True)
     if (root / "manifest.json").exists():
@@ -156,17 +274,25 @@ def prepare(args):
     marker = root / ".prepare_incomplete"
     if marker.exists() or list(root.glob("*.bin*")) or (root / "tokenizer").exists():
         raise ValueError("Incomplete data already present. Inspect it or use a new directory.")
+    weights = ({"web": .8, "code": .1, "math": .1} if args.code_jsonl
+               else dict(recipe["weights"]))
+    if any(int(args.train_tokens * w) < args.seq_len + 1 for w in weights.values()):
+        raise ValueError("Token target too small for at least one source.")
     marker.write_text(datetime.now().isoformat(), encoding="utf-8")
-    tok = AutoTokenizer.from_pretrained(TOKENIZER)
+    started = time.monotonic()
+    names = list(weights)
+    first_source = next(n for n in names if n != "code")
+    if args.tokenizer == "train":
+        tok, tokenizer_info = build_tokenizer(args, first_source, names.index(first_source))
+    else:
+        tok = AutoTokenizer.from_pretrained(args.tokenizer)
+        tokenizer_info = {"name": args.tokenizer, "trained": False, "vocab_size": len(tok)}
     if tok.eos_token_id is None:
         raise ValueError("Tokenizer needs an EOS token.")
     dtype = np.dtype("uint16" if len(tok) <= 65536 else "uint32")
-    weights = {"web": .8, "code": .1, "math": .1} if args.code_jsonl else {"web": .9, "math": .1}
-    if any(int(args.train_tokens * w) < args.seq_len + 1 for w in weights.values()):
-        raise ValueError("Token target too small for at least one source.")
     seen, info = set(), {}
-    started = time.monotonic()
-    LOG.info("Preparing %s training tokens; %s validation tokens PER source",
+    LOG.info("Recipe=%s | tokenizer=%s | vocab=%s | %s training tokens | %s validation tokens PER source",
+             args.recipe, tokenizer_info["name"], f"{len(tok):,}",
              f"{args.train_tokens:,}", f"{args.val_tokens:,}")
     with progress_bar() as progress:
         for index, (name, weight) in enumerate(weights.items()):
@@ -175,11 +301,8 @@ def prepare(args):
                 rows = local_rows(args.code_jsonl)
                 description = {"local_jsonl": str(Path(args.code_jsonl).resolve())}
             else:
-                repo, config = SOURCES[name]
-                LOG.info("Loading %s: %s / %s", name, repo, config)
-                rows = load_dataset(repo, config, split="train", streaming=True)
-                rows = rows.shuffle(seed=args.seed + index, buffer_size=args.shuffle_buffer)
-                description = {"repo": repo, "config": config}
+                LOG.info("Loading %s: %s / %s", name, *SOURCES[name])
+                rows, description = open_source(name, args.seed + index, args.shuffle_buffer)
             counts = {"train": 0, "val": 0}
             docs = {"train": 0, "val": 0}
             hashes = {s: hashlib.sha256() for s in targets}
@@ -189,15 +312,14 @@ def prepare(args):
             with contextlib.ExitStack() as stack:
                 files = {s: stack.enter_context(open(str(p) + ".tmp", "wb")) for s, p in paths.items()}
                 for row in rows:
-                    text = row.get("text") or row.get("content") or row.get("code")
-                    if not isinstance(text, str) or len(text.strip()) < 80:
+                    normalized = row_text(row)
+                    if normalized is None:
                         continue
-                    normalized = text.strip()
-                    digest = hashlib.sha256(normalized.encode("utf-8")).digest()
+                    digest = text_digest(normalized)
                     if digest in seen:
                         continue
                     seen.add(digest)
-                    split = "val" if int.from_bytes(digest[:8], "little") % 100 < 2 else "train"
+                    split = "val" if is_validation_digest(digest) else "train"
                     if counts[split] >= targets[split]:
                         continue
                     ids = tok(
@@ -213,9 +335,9 @@ def prepare(args):
                     docs[split] += 1
                     progress.update(tasks[split], advance=len(ids))
                     if time.monotonic() - last_log >= 30:
-                        elapsed = time.monotonic() - started
                         LOG.info("Prepare %s | train=%s | val=%s | elapsed=%s",
-                                 name, f"{counts['train']:,}", f"{counts['val']:,}", duration(elapsed))
+                                 name, f"{counts['train']:,}", f"{counts['val']:,}",
+                                 duration(time.monotonic() - started))
                         last_log = time.monotonic()
                     if all(counts[s] >= targets[s] for s in targets):
                         break
@@ -223,7 +345,9 @@ def prepare(args):
                     handle.flush()
                     os.fsync(handle.fileno())
             if counts != targets:
-                raise RuntimeError(f"Source {name} exhausted: got {counts}, wanted {targets}.")
+                raise RuntimeError(
+                    f"Source {name} exhausted: got {counts}, wanted {targets}. "
+                    "Lower --train-tokens and use a new --data directory.")
             for split, path in paths.items():
                 temporary = Path(str(path) + ".tmp")
                 if temporary.stat().st_size != counts[split] * dtype.itemsize:
@@ -238,6 +362,7 @@ def prepare(args):
     tok.save_pretrained(root / "tokenizer")
     write_json(root / "manifest.json", {
         "dtype": dtype.name, "vocab_size": len(tok), "eos_token_id": tok.eos_token_id,
+        "recipe": args.recipe, "tokenizer": tokenizer_info,
         "sources": info, "args": vars(args),
         "preparation_seconds": time.monotonic() - started,
     })
@@ -314,6 +439,34 @@ def verify(args):
     LOG.info("Data verification successful | fingerprint=%s", fingerprint)
 
 
+def make_config(settings, tok):
+    hidden, heads, kv = settings["hidden_size"], settings["num_heads"], settings["num_kv_heads"]
+    if hidden % heads or heads % kv:
+        raise ValueError("hidden_size must be divisible by num_heads, and num_heads by num_kv_heads.")
+    if (hidden // heads) % 2:
+        raise ValueError("Attention head dimension must be even for rotary embeddings.")
+    config = LlamaConfig(
+        vocab_size=len(tok), hidden_size=hidden,
+        intermediate_size=settings["intermediate_size"],
+        num_hidden_layers=settings["num_layers"], num_attention_heads=heads,
+        num_key_value_heads=kv, max_position_embeddings=settings["seq_len"],
+        rope_theta=10000.0, hidden_act="silu", tie_word_embeddings=True,
+        attention_dropout=0.0, eos_token_id=tok.eos_token_id,
+        bos_token_id=tok.bos_token_id, pad_token_id=tok.eos_token_id, use_cache=False,
+    )
+    config._attn_implementation = "sdpa"
+    return config
+
+
+def log_model_size(model):
+    total = sum(p.numel() for p in model.parameters())
+    embedding = model.get_input_embeddings().weight.numel()
+    LOG.info("Parameters=%s | embedding/output (tied)=%s (%.1f%%) | transformer blocks=%s (%.1f%%)",
+             f"{total:,}", f"{embedding:,}", 100 * embedding / total,
+             f"{total - embedding:,}", 100 * (total - embedding) / total)
+    return total
+
+
 def loss_for(model, x, y):
     logits = model(input_ids=x, use_cache=False).logits
     return torch.nn.functional.cross_entropy(logits.reshape(-1, logits.size(-1)), y.reshape(-1))
@@ -364,7 +517,9 @@ def train(args):
         raise RuntimeError("CUDA GPU required.")
     checkpoint = load_checkpoint(args.resume) if args.resume else None
     if checkpoint:
-        settings = dict(checkpoint["settings"])
+        settings = {**TRAIN_DEFAULTS, **checkpoint["settings"]}
+        for key, config_key in CONFIG_KEYS.items():
+            settings[key] = checkpoint["config"][config_key]
         root = Path(checkpoint["output_directory"])
         if args.out and Path(args.out).resolve() != root:
             raise ValueError("Resume must use the original --out directory.")
@@ -410,14 +565,7 @@ def train(args):
     else:
         dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
         dtype_name = str(dtype).split(".")[-1]
-        config = LlamaConfig(
-            vocab_size=len(tok), hidden_size=512, intermediate_size=1536,
-            num_hidden_layers=12, num_attention_heads=8, num_key_value_heads=8,
-            max_position_embeddings=settings["seq_len"], rope_theta=10000.0,
-            hidden_act="silu", tie_word_embeddings=True, attention_dropout=0.0,
-            eos_token_id=tok.eos_token_id, bos_token_id=tok.bos_token_id,
-            pad_token_id=tok.eos_token_id, use_cache=False,
-        )
+        config = make_config(settings, tok)
     config.use_cache = False
     config._attn_implementation = "sdpa"
     model = LlamaForCausalLM(config).cuda()
@@ -432,9 +580,13 @@ def train(args):
     if checkpoint:
         optimizer.load_state_dict(checkpoint["optimizer"])
         scaler.load_state_dict(checkpoint["scaler"])
-    nparams = sum(p.numel() for p in model.parameters())
     tokens_per_step = settings["batch_size"] * settings["accumulation"] * settings["seq_len"]
-    LOG.info("GPU: %s | parameters=%s | dtype=%s", torch.cuda.get_device_name(), f"{nparams:,}", dtype_name)
+    LOG.info("GPU: %s | dtype=%s | recipe=%s | vocab=%s", torch.cuda.get_device_name(),
+             dtype_name, store.meta.get("recipe", "web_math"), f"{len(tok):,}")
+    LOG.info("Layers=%d | hidden=%d | intermediate=%d | heads=%d | kv_heads=%d",
+             config.num_hidden_layers, config.hidden_size, config.intermediate_size,
+             config.num_attention_heads, config.num_key_value_heads)
+    nparams = log_model_size(model)
     LOG.info("Microbatch=%d | accumulation=%d | context=%d | tokens/update=%s",
              settings["batch_size"], settings["accumulation"], settings["seq_len"], f"{tokens_per_step:,}")
     LOG.info("Evaluation: %d x %d x %d = %s token positions per source",
@@ -452,10 +604,11 @@ def train(args):
             x, y = store.batch(name, "train", settings["batch_size"])
             with torch.autocast(device_type="cuda", dtype=dtype):
                 loss = loss_for(model, x, y)
-            if not torch.isfinite(loss).item():
-                raise FloatingPointError("Non-finite loss; last saved checkpoint was not replaced.")
             total += loss.detach() / settings["accumulation"]
             scaler.scale(loss / settings["accumulation"]).backward()
+        total_value = total.item()
+        if not math.isfinite(total_value):
+            raise FloatingPointError("Non-finite loss; last saved checkpoint was not replaced.")
         scaler.unscale_(optimizer)
         norm = torch.nn.utils.clip_grad_norm_(
             model.parameters(), 1.0, error_if_nonfinite=(dtype == torch.bfloat16),
@@ -464,7 +617,7 @@ def train(args):
         scaler.step(optimizer)
         scaler.update()
         skipped = scaler.is_enabled() and scaler.get_scale() < old_scale
-        return total.item(), float(norm), skipped
+        return total_value, float(norm), skipped
 
     session_start = time.monotonic()
     deadline = session_start + args.hours * 3600
@@ -683,43 +836,270 @@ def train(args):
             signal.signal(sig, previous)
 
 
+def find_clean_window(arr, eos_id, length, index=0, scan=5_000_000):
+    """Start of the index-th stretch of `length` tokens that contains no EOS token."""
+    head = np.asarray(arr[:min(len(arr), scan)])
+    eos_positions = np.flatnonzero(head == eos_id)
+    starts = np.concatenate(([-1], eos_positions))
+    ends = np.concatenate((eos_positions, [len(head)]))
+    candidates = np.flatnonzero(ends - starts - 1 >= length)
+    if index >= len(candidates):
+        raise ValueError(f"Only {len(candidates)} EOS-free windows of {length} tokens found.")
+    return int(starts[candidates[index]] + 1)
+
+
+def overfit(args):
+    """Pipeline check: can the model memorize ONE fixed window, and does generate() reproduce it?"""
+    if not torch.cuda.is_available():
+        raise RuntimeError("CUDA GPU required.")
+    if args.window_tokens > args.seq_len:
+        raise ValueError("--window-tokens must not exceed --seq-len.")
+    if not 0 < args.prompt_tokens < args.window_tokens:
+        raise ValueError("--prompt-tokens must lie inside the window.")
+    seed_all(args.seed)
+    root = Path(args.out)
+    root.mkdir(parents=True, exist_ok=True)
+    store = TokenStore(args.data, args.seq_len, args.seed)
+    tok = AutoTokenizer.from_pretrained(store.root / "tokenizer")
+    source = args.source or store.names[0]
+    if source not in store.names:
+        raise ValueError(f"Unknown source {source}; available: {store.names}")
+    arr = store.arrays[source, "train"]
+    length = args.window_tokens + 1
+    start = find_clean_window(arr, tok.eos_token_id, length, args.window_index)
+    window = np.asarray(arr[start:start + length], dtype=np.int64)
+    if int(window.max()) >= len(tok):
+        raise ValueError("Window contains token IDs outside the tokenizer vocabulary.")
+    settings = {key: MODEL_DEFAULTS[key] if getattr(args, key) is None else getattr(args, key)
+                for key in MODEL_KEYS}
+    settings["seq_len"] = args.seq_len
+    dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
+    config = make_config(settings, tok)
+    model = LlamaForCausalLM(config).cuda()
+    log_model_size(model)
+    x = torch.from_numpy(window[:-1]).unsqueeze(0).cuda()
+    y = torch.from_numpy(window[1:]).unsqueeze(0).cuda()
+    LOG.info("Overfit window: source=%s start=%s tokens=%d", source, f"{start:,}", length)
+    LOG.info("Window text: %s", repr(tok.decode(window.tolist())[:240]))
+    optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, betas=(.9, .95),
+                                  weight_decay=0.0, fused=True)
+    scaler = torch.amp.GradScaler("cuda", enabled=dtype == torch.float16)
+    warmup = max(1, min(20, args.steps // 10))
+    model.train()
+    started = time.monotonic()
+    final_loss, final_acc, steps_done = float("nan"), 0.0, 0
+    for step in range(1, args.steps + 1):
+        lr = args.lr * min(1.0, step / warmup)
+        for group in optimizer.param_groups:
+            group["lr"] = lr
+        optimizer.zero_grad(set_to_none=True)
+        with torch.autocast(device_type="cuda", dtype=dtype):
+            logits = model(input_ids=x, use_cache=False).logits
+        loss = torch.nn.functional.cross_entropy(logits.float().reshape(-1, logits.size(-1)), y.reshape(-1))
+        scaler.scale(loss).backward()
+        scaler.unscale_(optimizer)
+        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+        scaler.step(optimizer)
+        scaler.update()
+        steps_done = step
+        if step == 1 or step % args.log_every == 0 or step == args.steps:
+            final_loss = loss.item()
+            final_acc = (logits.argmax(-1) == y).float().mean().item()
+            if not math.isfinite(final_loss):
+                raise FloatingPointError("Non-finite loss during overfit test.")
+            LOG.info("Overfit step %d/%d | loss=%.4f | next-token accuracy=%.3f | lr=%.2e | elapsed=%s",
+                     step, args.steps, final_loss, final_acc, lr, duration(time.monotonic() - started))
+            if final_loss < args.target_loss:
+                break
+    model.eval()
+    with torch.no_grad(), torch.autocast(device_type="cuda", dtype=dtype):
+        tf_accuracy = (model(input_ids=x, use_cache=False).logits.argmax(-1) == y).float().mean().item()
+    prompt = torch.from_numpy(window[:args.prompt_tokens]).unsqueeze(0).cuda()
+    needed = length - args.prompt_tokens
+    model.config.use_cache = True
+    with torch.inference_mode(), torch.autocast(device_type="cuda", dtype=dtype):
+        out = model.generate(
+            input_ids=prompt, attention_mask=torch.ones_like(prompt), max_new_tokens=needed,
+            do_sample=False, repetition_penalty=1.0,
+            pad_token_id=tok.eos_token_id, eos_token_id=tok.eos_token_id,
+        )
+    generated = out[0, args.prompt_tokens:].cpu().numpy()
+    target = window[args.prompt_tokens:]
+    compared = min(len(generated), len(target))
+    matches = generated[:compared] == target[:compared]
+    match_rate = float(matches.sum()) / needed
+    mismatches = np.flatnonzero(~matches)
+    divergence = int(mismatches[0]) if len(mismatches) else (compared if compared < needed else None)
+    LOG.info("Teacher-forced next-token accuracy (eval mode): %.3f", tf_accuracy)
+    LOG.info("Greedy generation reproduces %.1f%% of %d continuation tokens | first divergence=%s",
+             100 * match_rate, needed, divergence)
+    LOG.info("Original:  %s", repr(tok.decode(target.tolist())[:240]))
+    LOG.info("Generated: %s", repr(tok.decode(generated.tolist())[:240]))
+    passed = match_rate >= args.pass_rate
+    if passed:
+        LOG.info("PASS: training objective, shifted targets and generation path are consistent.")
+    elif tf_accuracy >= .99:
+        LOG.error("FAIL: teacher-forced accuracy is high but generation diverges; inspect the generation path.")
+    else:
+        LOG.error("FAIL: window was not memorized; try more --steps, another --lr, or check data/targets.")
+    write_json(root / "overfit_result.json", {
+        "passed": passed, "steps": steps_done, "final_loss": final_loss,
+        "final_train_accuracy": final_acc, "teacher_forced_accuracy_eval": tf_accuracy,
+        "generation_match_rate": match_rate, "first_divergence": divergence,
+        "window_start": start, "window_tokens": length, "source": source,
+        "settings": settings, "lr": args.lr, "pass_rate": args.pass_rate,
+    })
+    if not passed:
+        raise SystemExit(2)
+
+
+def load_prompts(args):
+    prompts = []
+    if args.prompt:
+        prompts.append(args.prompt)
+    if args.prompt_set:
+        prompts.extend(PROMPT_SETS[args.prompt_set])
+    if args.prompts_file:
+        text = Path(args.prompts_file).read_text(encoding="utf-8")
+        prompts.extend(line.strip() for line in text.splitlines() if line.strip())
+    if not prompts:
+        prompts.append("The solar system consists of")
+    return list(dict.fromkeys(prompts))
+
+
 def sample(args):
     if not torch.cuda.is_available():
         raise RuntimeError("CUDA GPU required.")
+
     root = Path(args.out)
     tokenizer_path = root / "tokenizer" if (root / "tokenizer").exists() else root
     tok = AutoTokenizer.from_pretrained(tokenizer_path)
     dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
+
     if args.checkpoint:
         path = Path(args.checkpoint)
         if not path.is_absolute() and not path.exists():
             path = root / path
+
         state = load_checkpoint(path)
         config = LlamaConfig.from_dict(state["config"])
         config._attn_implementation = "sdpa"
+
         model = LlamaForCausalLM(config)
         model.load_state_dict(state["model"])
+        step = state.get("completed_steps")
         del state
+
         model = model.to(device="cuda", dtype=dtype).eval()
-        LOG.info("Sampling checkpoint: %s", path)
+        source_name = f"{path.name}@step{step}"
+        LOG.info("Sampling checkpoint: %s (step %s)", path, step)
     else:
-        model = LlamaForCausalLM.from_pretrained(root, dtype=dtype, attn_implementation="sdpa").cuda().eval()
+        model = LlamaForCausalLM.from_pretrained(
+            root,
+            dtype=dtype,
+            attn_implementation="sdpa",
+        ).cuda().eval()
+        source_name = "exported_model"
+
     model.config.use_cache = True
-    seed_all(args.seed)
-    x = tok(args.prompt, return_tensors="pt", add_special_tokens=False).to("cuda")
-    remaining = model.config.max_position_embeddings - x.input_ids.shape[1]
-    if remaining <= 0 or x.input_ids.shape[1] == 0:
-        raise ValueError("Prompt must be nonempty and shorter than the configured context.")
-    options = {
-        "max_new_tokens": min(args.new_tokens, remaining), "do_sample": not args.greedy,
-        "repetition_penalty": args.repetition_penalty,
-        "pad_token_id": tok.eos_token_id, "eos_token_id": tok.eos_token_id,
-    }
-    if not args.greedy:
-        options.update(temperature=args.temperature, top_p=args.top_p)
-    with torch.inference_mode():
-        y = model.generate(**x, **options)
-    print(tok.decode(y[0], skip_special_tokens=True))
+    prompts = load_prompts(args)
+
+    if args.greedy:
+        modes = [("greedy", args.seed)]
+    else:
+        modes = [("greedy", args.seed)] if args.also_greedy else []
+        modes += [
+            ("sample", args.seed + i)
+            for i in range(args.num_samples)
+        ]
+
+    output_path = Path(args.output) if args.output else root / "samples.jsonl"
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    written = 0
+
+    with output_path.open("a", encoding="utf-8") as handle:
+        for index, prompt in enumerate(prompts, 1):
+            x = tok(
+                prompt,
+                return_tensors="pt",
+                add_special_tokens=False,
+                return_token_type_ids=False,
+            )
+
+            # Llama receives no token_type_ids.
+            x.pop("token_type_ids", None)
+            x = x.to("cuda")
+
+            prompt_tokens = x.input_ids.shape[1]
+            remaining = model.config.max_position_embeddings - prompt_tokens
+
+            if remaining <= 0 or prompt_tokens == 0:
+                LOG.warning(
+                    "Skipping prompt %d: empty or too long for the context window.",
+                    index,
+                )
+                continue
+
+            for mode, seed in modes:
+                options = {
+                    "max_new_tokens": min(args.new_tokens, remaining),
+                    "do_sample": mode == "sample",
+                    "repetition_penalty": args.repetition_penalty,
+                    "pad_token_id": tok.eos_token_id,
+                    "eos_token_id": tok.eos_token_id,
+                }
+
+                if mode == "sample":
+                    options.update(
+                        temperature=args.temperature,
+                        top_p=args.top_p,
+                    )
+
+                seed_all(seed)
+
+                with torch.inference_mode():
+                    y = model.generate(**x, **options)
+
+                text = tok.decode(y[0], skip_special_tokens=True)
+
+                LOG.info(
+                    "Generation | prompt=%d/%d | mode=%s | seed=%d\n%s",
+                    index,
+                    len(prompts),
+                    mode,
+                    seed,
+                    text,
+                )
+
+                handle.write(
+                    json.dumps(
+                        {
+                            "time": datetime.now().isoformat(timespec="seconds"),
+                            "model": source_name,
+                            "prompt": prompt,
+                            "mode": mode,
+                            "seed": seed,
+                            "temperature": (
+                                args.temperature if mode == "sample" else None
+                            ),
+                            "top_p": args.top_p if mode == "sample" else None,
+                            "repetition_penalty": args.repetition_penalty,
+                            "new_tokens": options["max_new_tokens"],
+                            "text": text,
+                        },
+                        ensure_ascii=False,
+                    )
+                    + "\n"
+                )
+                handle.flush()
+                written += 1
+
+    LOG.info("Saved %d generations to %s", written, output_path)
+
+def add_model_arguments(sub):
+    for key in MODEL_KEYS:
+        sub.add_argument("--" + key.replace("_", "-"), type=int, default=None,
+                         help=f"default {MODEL_DEFAULTS[key]}")
 
 
 def main():
@@ -727,8 +1107,14 @@ def main():
     subs = parser.add_subparsers(dest="command", required=True)
     prep = subs.add_parser("prepare", help="Prepare a NEW token dataset directory")
     prep.add_argument("--data", default="mini_data")
-    prep.add_argument("--train-tokens", type=int, default=1_000_000_000)
+    prep.add_argument("--recipe", choices=sorted(RECIPES), default="web_math")
+    prep.add_argument("--train-tokens", type=int, default=None,
+                      help="default: 1B (web_math) or 300M (tinystories)")
     prep.add_argument("--val-tokens", type=int, default=1_048_576, help="Per source")
+    prep.add_argument("--tokenizer", default=None,
+                      help="HF id/path, or 'train' for a new byte-level BPE (default for tinystories)")
+    prep.add_argument("--vocab-size", type=int, default=8192, help="Only for --tokenizer train")
+    prep.add_argument("--tokenizer-docs", type=int, default=200_000, help="Only for --tokenizer train")
     prep.add_argument("--code-jsonl")
     prep.add_argument("--seq-len", type=int, default=512)
     prep.add_argument("--shuffle-buffer", type=int, default=1000)
@@ -752,19 +1138,41 @@ def main():
     for key in ("lr", "eval_every_minutes", "checkpoint_every_minutes", "warmup", "decay"):
         tr.add_argument("--" + key.replace("_", "-"), type=float, default=None)
     tr.add_argument("--gradient-checkpointing", action="store_true", default=None)
+    add_model_arguments(tr)
     tr.set_defaults(func=train)
+    ov = subs.add_parser("overfit", help="Memorize one fixed window to test the training/generation pipeline")
+    ov.add_argument("--data", required=True)
+    ov.add_argument("--out", required=True)
+    ov.add_argument("--source", help="Data source name (default: first source)")
+    ov.add_argument("--seq-len", type=int, default=512)
+    ov.add_argument("--window-tokens", type=int, default=256)
+    ov.add_argument("--prompt-tokens", type=int, default=32)
+    ov.add_argument("--window-index", type=int, default=0)
+    ov.add_argument("--steps", type=int, default=600)
+    ov.add_argument("--lr", type=float, default=1e-3)
+    ov.add_argument("--target-loss", type=float, default=0.02)
+    ov.add_argument("--pass-rate", type=float, default=0.95)
+    ov.add_argument("--log-every", type=int, default=25)
+    ov.add_argument("--seed", type=int, default=42)
+    add_model_arguments(ov)
+    ov.set_defaults(func=overfit)
     sm = subs.add_parser("sample")
     sm.add_argument("--out", required=True)
     sm.add_argument("--checkpoint", help="Optional checkpoint file, e.g. checkpoint_best.pt")
-    sm.add_argument("--prompt", default="The solar system consists of")
+    sm.add_argument("--prompt", help="Single prompt (can be combined with the options below)")
+    sm.add_argument("--prompt-set", choices=sorted(PROMPT_SETS), help="Built-in fixed prompt list")
+    sm.add_argument("--prompts-file", help="Text file with one prompt per line")
     sm.add_argument("--new-tokens", type=int, default=60)
     sm.add_argument("--seed", type=int, default=42)
-    sm.add_argument("--greedy", action="store_true")
+    sm.add_argument("--num-samples", type=int, default=1, help="Samples per prompt; seeds are seed, seed+1, ...")
+    sm.add_argument("--greedy", action="store_true", help="Greedy only")
+    sm.add_argument("--also-greedy", action="store_true", help="Add one greedy output before the samples")
     sm.add_argument("--temperature", type=float, default=.8)
     sm.add_argument("--top-p", type=float, default=.95)
     sm.add_argument("--repetition-penalty", type=float, default=1.0)
+    sm.add_argument("--output", help="JSONL file (default: <out>/samples.jsonl, appended)")
     sm.set_defaults(func=sample)
-    for sub in (prep, ver, tr, sm):
+    for sub in (prep, ver, tr, ov, sm):
         sub.add_argument("--log-file", help="Plain-text logfile; appended on resume")
         sub.add_argument("--log-level", choices=("DEBUG", "INFO", "WARNING", "ERROR"), default="INFO")
     args = parser.parse_args()
@@ -772,7 +1180,9 @@ def main():
         "train_tokens", "val_tokens", "seq_len", "shuffle_buffer", "max_chars", "max_doc_tokens",
         "batch_size", "accumulation", "eval_batch_size", "eval_batches", "log_every", "hours",
         "eval_every_minutes", "checkpoint_every_minutes", "max_steps", "new_tokens", "lr",
-        "temperature", "repetition_penalty",
+        "temperature", "repetition_penalty", "vocab_size", "tokenizer_docs", "num_samples",
+        "steps", "window_tokens", "prompt_tokens", "target_loss", "pass_rate",
+        *MODEL_KEYS,
     )
     for key in positive:
         value = getattr(args, key, None)
@@ -780,6 +1190,8 @@ def main():
             parser.error(f"--{key.replace('_', '-')} must be finite and positive")
     if args.command == "sample" and not 0 < args.top_p <= 1:
         parser.error("--top-p must lie in (0, 1]")
+    if args.command == "overfit" and (args.window_index < 0 or args.pass_rate > 1):
+        parser.error("--window-index must be >= 0 and --pass-rate <= 1")
     if hasattr(args, "seed") and args.seed is not None and not 0 <= args.seed < 2**32:
         parser.error("--seed must lie in [0, 2**32)")
     log_file = args.log_file
@@ -789,6 +1201,8 @@ def main():
             log_file = directory / "train.log"
         elif args.command in ("prepare", "verify"):
             log_file = Path(args.data) / f"{args.command}.log"
+        elif args.command == "overfit":
+            log_file = Path(args.out) / "overfit.log"
         else:
             log_file = Path(args.out) / "sample.log"
     configure_logging(log_file, args.log_level)
